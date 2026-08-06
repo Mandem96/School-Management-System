@@ -1,0 +1,66 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Teacher {
+  id     Int    @id @default(autoincrement())
+  name   String
+  email  String @unique
+  password String // stored as a bcrypt hash
+
+  // Basic contact info
+  phone    String?
+  photoUrl String?
+
+  // Personal details
+  dateOfBirth DateTime?
+  nationality String?
+
+  // Employment details
+  subject                  String?
+  qualification            String?
+  rank                     String?
+  firstAppointmentDate     DateTime?
+  dateAppointedCurrentRank DateTime?
+
+  // National ID numbers
+  ghanaCardNumber String? @unique
+  ssnitNumber     String? @unique
+
+  createdAt DateTime @default(now())
+
+  attendance  Attendance[]
+  lessonNotes LessonNote[]
+}
+
+model Attendance {
+  id        Int       @id @default(autoincrement())
+  teacherId Int
+  teacher   Teacher   @relation(fields: [teacherId], references: [id])
+  date      DateTime  @default(now())
+  status    String    // "present", "late", or "absent"
+  checkIn   DateTime?
+  createdAt DateTime  @default(now())
+}
+
+model LessonNote {
+  id         Int       @id @default(autoincrement())
+  teacherId  Int
+  teacher    Teacher   @relation(fields: [teacherId], references: [id])
+  title      String
+  subject    String?
+  week       String?
+  fileName   String
+  filePath   String
+  status     String    @default("pending") // "pending", "approved", "needs_revision"
+  comment    String?
+  reviewedAt DateTime?
+  createdAt  DateTime  @default(now())
+}
