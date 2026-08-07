@@ -56,6 +56,34 @@ const upload = multer({
   },
 });
 
+// Separate uploader for profile photos (images only)
+const PHOTO_DIR = path.join(UPLOAD_DIR, 'photos');
+if (!fs.existsSync(PHOTO_DIR)) {
+  fs.mkdirSync(PHOTO_DIR, { recursive: true });
+}
+
+const photoStorage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, PHOTO_DIR),
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    cb(null, uniqueSuffix + '-' + file.originalname);
+  },
+});
+
+const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+
+const photoUpload = multer({
+  storage: photoStorage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  fileFilter: (req, file, cb) => {
+    if (ALLOWED_IMAGE_TYPES.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only JPG, PNG, or WEBP images are allowed'));
+    }
+  },
+});
+
 // ================== AUTH HELPERS ==================
 
 // Removes the password field before sending a teacher object back to the client
@@ -163,7 +191,39 @@ app.put('/teachers/me/password', authenticate, requireTeacher, async (req, res) 
   }
 });
 
-// Get the currently logged-in teacher's own profile
+// A teacher uploads/updates their own profile photo
+app.post('/teachers/me/photo', authenticate, requireTeacher, photoUpload.single('photo'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'A photo (JPG, PNG, or WEBP) is required' });
+    }
+    const teacher = await prisma.teacher.update({
+      where: { id: req.user.teacherId },
+      data: { photoUrl: `uploads/photos/${req.file.filename}` },
+    });
+    res.json(sanitizeTeacher(teacher));
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Headteacher can also set/update a teacher's photo
+app.post('/teachers/:id/photo', authenticate, requireHeadteacher, photoUpload.single('photo'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'A photo (JPG, PNG, or WEBP) is required' });
+    }
+    const teacher = await prisma.teacher.update({
+      where: { id: Number(req.params.id) },
+      data: { photoUrl: `uploads/photos/${req.file.filename}` },
+    });
+    res.json(sanitizeTeacher(teacher));
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+
 app.get('/teachers/me', authenticate, requireTeacher, async (req, res) => {
   try {
     const teacher = await prisma.teacher.findUnique({ where: { id: req.user.teacherId } });
@@ -328,7 +388,7 @@ app.get('/attendance', authenticate, async (req, res) => {
 
     const records = await prisma.attendance.findMany({
       where,
-      include: { teacher: { select: { id: true, name: true, subject: true } } },
+      include: { teacher: { select: { id: true, name: true, subject: true, photoUrl: true } } },
       orderBy: { date: 'desc' },
     });
     res.json(records);
@@ -341,7 +401,7 @@ app.get('/attendance/:id', authenticate, async (req, res) => {
   try {
     const record = await prisma.attendance.findUnique({
       where: { id: Number(req.params.id) },
-      include: { teacher: { select: { id: true, name: true, subject: true } } },
+      include: { teacher: { select: { id: true, name: true, subject: true, photoUrl: true } } },
     });
     if (!record) {
       return res.status(404).json({ error: 'Attendance record not found' });
@@ -401,6 +461,8 @@ app.get('/attendance/stats/punctuality', authenticate, requireHeadteacher, async
         teacherId: t.id,
         name: t.name,
         subject: t.subject,
+        photoUrl: t.photoUrl,
+        rank: t.rank,
         totalRecords: total,
         lateCount,
         latePercentage,
@@ -473,7 +535,7 @@ app.get('/lesson-notes', authenticate, async (req, res) => {
 
     const notes = await prisma.lessonNote.findMany({
       where,
-      include: { teacher: { select: { id: true, name: true, subject: true } } },
+      include: { teacher: { select: { id: true, name: true, subject: true, photoUrl: true } } },
       orderBy: { createdAt: 'desc' },
     });
     res.json(notes);
@@ -486,7 +548,7 @@ app.get('/lesson-notes/:id', authenticate, async (req, res) => {
   try {
     const note = await prisma.lessonNote.findUnique({
       where: { id: Number(req.params.id) },
-      include: { teacher: { select: { id: true, name: true, subject: true } } },
+      include: { teacher: { select: { id: true, name: true, subject: true, photoUrl: true } } },
     });
     if (!note) {
       return res.status(404).json({ error: 'Lesson note not found' });
