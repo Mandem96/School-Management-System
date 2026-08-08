@@ -6,6 +6,9 @@ const fs = require('fs');
 const multer = require('multer');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const pdfParse = require('pdf-parse');
+const mammoth = require('mammoth');
+const Anthropic = require('@anthropic-ai/sdk');
 const { PrismaClient } = require('@prisma/client');
 const { PrismaPg } = require('@prisma/adapter-pg');
 
@@ -13,6 +16,7 @@ const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
 
 const app = express();
 const prisma = new PrismaClient({ adapter });
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const HEADTEACHER_EMAIL = process.env.HEADTEACHER_EMAIL;
@@ -74,7 +78,7 @@ const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 
 const photoUpload = multer({
   storage: photoStorage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB
   fileFilter: (req, file, cb) => {
     if (ALLOWED_IMAGE_TYPES.includes(file.mimetype)) {
       cb(null, true);
@@ -234,6 +238,38 @@ app.get('/teachers/me', authenticate, requireTeacher, async (req, res) => {
   }
 });
 
+// A teacher corrects their own profile details (e.g. fixing a typo the
+// headteacher made when first adding them). Password is changed separately
+// via /teachers/me/password, not here.
+app.put('/teachers/me', authenticate, requireTeacher, async (req, res) => {
+  try {
+    const {
+      name, email, phone, subject,
+      dateOfBirth, nationality, qualification, rank,
+      firstAppointmentDate, dateAppointedCurrentRank,
+      ghanaCardNumber, ssnitNumber,
+    } = req.body;
+
+    const teacher = await prisma.teacher.update({
+      where: { id: req.user.teacherId },
+      data: {
+        name, email, phone, subject,
+        dateOfBirth: dateOfBirth ? new Date(dateOfBirth) : undefined,
+        nationality,
+        qualification,
+        rank,
+        firstAppointmentDate: firstAppointmentDate ? new Date(firstAppointmentDate) : undefined,
+        dateAppointedCurrentRank: dateAppointedCurrentRank ? new Date(dateAppointedCurrentRank) : undefined,
+        ghanaCardNumber,
+        ssnitNumber,
+      },
+    });
+    res.json(sanitizeTeacher(teacher));
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 // ================== TEACHER ROUTES (headteacher only) ==================
 
 app.post('/teachers', authenticate, requireHeadteacher, async (req, res) => {
@@ -321,9 +357,21 @@ app.put('/teachers/:id', authenticate, requireHeadteacher, async (req, res) => {
 
 app.delete('/teachers/:id', authenticate, requireHeadteacher, async (req, res) => {
   try {
-    await prisma.teacher.delete({
-      where: { id: Number(req.params.id) },
-    });
+    const teacherId = Number(req.params.id);
+
+    // Delete the lesson note files from disk first
+    const notes = await prisma.lessonNote.findMany({ where: { teacherId } });
+    for (const note of notes) {
+      const fullPath = path.join(__dirname, note.filePath);
+      if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+    }
+
+    // A teacher can't be deleted while attendance/lesson note records still
+    // point to them, so remove those first, then the teacher itself.
+    await prisma.lessonNote.deleteMany({ where: { teacherId } });
+    await prisma.attendance.deleteMany({ where: { teacherId } });
+    await prisma.teacher.delete({ where: { id: teacherId } });
+
     res.json({ message: 'Teacher deleted successfully' });
   } catch (error) {
     res.status(400).json({ error: error.message });
@@ -494,6 +542,75 @@ app.get('/attendance/stats/punctuality', authenticate, requireHeadteacher, async
   }
 });
 
+// ================== ATTENDANCE ANOMALY DETECTION ==================
+// Pure statistics, no AI call needed — flags a teacher/weekday combo where
+// their late-or-absent rate on that specific weekday is notably higher
+// than their overall average (e.g. "always late on Mondays").
+const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const MIN_OCCURRENCES_ON_WEEKDAY = 2; // need at least this many records on that weekday to flag it
+const ANOMALY_THRESHOLD_MULTIPLIER = 1.5; // weekday rate must be this many times the overall rate
+
+app.get('/attendance/anomalies', authenticate, requireHeadteacher, async (req, res) => {
+  try {
+    const teachers = await prisma.teacher.findMany({
+      include: { attendance: true },
+    });
+
+    const anomalies = [];
+
+    for (const teacher of teachers) {
+      const total = teacher.attendance.length;
+      if (total < 4) continue; // not enough history to say anything meaningful
+
+      const overallLateCount = teacher.attendance.filter(
+        (a) => a.status === 'late' || a.status === 'absent'
+      ).length;
+      const overallRate = overallLateCount / total;
+
+      // Group this teacher's records by day of week
+      const byWeekday = {}; // 0-6 -> { total, late }
+      for (const record of teacher.attendance) {
+        const day = new Date(record.date).getDay();
+        if (!byWeekday[day]) byWeekday[day] = { total: 0, late: 0 };
+        byWeekday[day].total += 1;
+        if (record.status === 'late' || record.status === 'absent') {
+          byWeekday[day].late += 1;
+        }
+      }
+
+      for (const [day, counts] of Object.entries(byWeekday)) {
+        if (counts.total < MIN_OCCURRENCES_ON_WEEKDAY) continue;
+        const weekdayRate = counts.late / counts.total;
+
+        const isNotablyWorse =
+          weekdayRate >= 0.5 && // at least half the time on this day
+          (overallRate === 0 ? weekdayRate > 0 : weekdayRate >= overallRate * ANOMALY_THRESHOLD_MULTIPLIER);
+
+        if (isNotablyWorse) {
+          anomalies.push({
+            teacherId: teacher.id,
+            name: teacher.name,
+            subject: teacher.subject,
+            photoUrl: teacher.photoUrl,
+            weekday: WEEKDAY_NAMES[day],
+            weekdayLateRate: Math.round(weekdayRate * 100),
+            overallLateRate: Math.round(overallRate * 100),
+            occurrences: counts.total,
+            lateOnThatDay: counts.late,
+          });
+        }
+      }
+    }
+
+    // Sort so the most severe patterns show first
+    anomalies.sort((a, b) => b.weekdayLateRate - a.weekdayLateRate);
+
+    res.json({ anomalies });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 // ================== LESSON NOTE ROUTES ==================
 
 // A teacher uploads their own lesson note (teacherId comes from their token, not the request body)
@@ -573,7 +690,295 @@ app.put('/lesson-notes/:id/review', authenticate, requireHeadteacher, async (req
       where: { id: Number(req.params.id) },
       data: { status, comment, reviewedAt: new Date() },
     });
+
+    // Let the teacher know their note was reviewed
+    await prisma.notification.create({
+      data: {
+        recipientRole: 'teacher',
+        teacherId: note.teacherId,
+        type: 'note_reviewed',
+        relatedId: note.id,
+        message:
+          status === 'approved'
+            ? `Your lesson note "${note.title}" was approved.`
+            : `Your lesson note "${note.title}" needs revision.`,
+      },
+    });
+
     res.json(note);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// ================== ANNOUNCEMENTS & EVENTS ==================
+
+// Headteacher posts an announcement or event. If eventDate is included,
+// it's treated as a calendar event; otherwise it's a plain announcement.
+app.post('/announcements', authenticate, requireHeadteacher, async (req, res) => {
+  try {
+    const { title, message, eventDate } = req.body;
+    if (!title || !message) {
+      return res.status(400).json({ error: 'Title and message are required' });
+    }
+
+    const announcement = await prisma.announcement.create({
+      data: {
+        title,
+        message,
+        eventDate: eventDate ? new Date(eventDate) : null,
+      },
+    });
+
+    // Notify every teacher
+    const teachers = await prisma.teacher.findMany({ select: { id: true } });
+    if (teachers.length > 0) {
+      await prisma.notification.createMany({
+        data: teachers.map((t) => ({
+          recipientRole: 'teacher',
+          teacherId: t.id,
+          type: 'new_announcement',
+          relatedId: announcement.id,
+          message: eventDate
+            ? `New event: "${title}"`
+            : `New announcement: "${title}"`,
+        })),
+      });
+    }
+
+    res.status(201).json(announcement);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// List announcements. Headteacher sees who has/hasn't acknowledged each one.
+// Teachers see whether they personally have acknowledged each one.
+app.get('/announcements', authenticate, async (req, res) => {
+  try {
+    const announcements = await prisma.announcement.findMany({
+      include: {
+        acknowledgements: {
+          include: { teacher: { select: { id: true, name: true, photoUrl: true } } },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    if (req.user.role === 'headteacher') {
+      return res.json(announcements);
+    }
+
+    // Teacher view: just flag whether they've acknowledged each one
+    const forTeacher = announcements.map((a) => ({
+      id: a.id,
+      title: a.title,
+      message: a.message,
+      eventDate: a.eventDate,
+      createdAt: a.createdAt,
+      acknowledged: a.acknowledgements.some((ack) => ack.teacherId === req.user.teacherId),
+      acknowledgedCount: a.acknowledgements.length,
+    }));
+    res.json(forTeacher);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// A teacher marks an announcement/event as seen
+app.post('/announcements/:id/acknowledge', authenticate, requireTeacher, async (req, res) => {
+  try {
+    const announcementId = Number(req.params.id);
+
+    const announcement = await prisma.announcement.findUnique({ where: { id: announcementId } });
+    if (!announcement) return res.status(404).json({ error: 'Announcement not found' });
+
+    // Avoid duplicate acknowledgements if they click it twice
+    const existing = await prisma.announcementAck.findUnique({
+      where: { announcementId_teacherId: { announcementId, teacherId: req.user.teacherId } },
+    });
+    if (existing) {
+      return res.json({ message: 'Already acknowledged', acknowledgedAt: existing.acknowledgedAt });
+    }
+
+    const ack = await prisma.announcementAck.create({
+      data: { announcementId, teacherId: req.user.teacherId },
+    });
+
+    const teacher = await prisma.teacher.findUnique({ where: { id: req.user.teacherId } });
+    await prisma.notification.create({
+      data: {
+        recipientRole: 'headteacher',
+        type: 'announcement_ack',
+        relatedId: announcementId,
+        message: `${teacher.name} acknowledged "${announcement.title}".`,
+      },
+    });
+
+    res.status(201).json(ack);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Headteacher can delete an announcement/event
+app.delete('/announcements/:id', authenticate, requireHeadteacher, async (req, res) => {
+  try {
+    const announcementId = Number(req.params.id);
+    await prisma.announcementAck.deleteMany({ where: { announcementId } });
+    await prisma.announcement.delete({ where: { id: announcementId } });
+    res.json({ message: 'Announcement deleted successfully' });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// ================== NOTIFICATIONS ==================
+
+// Get the current user's notifications (headteacher or teacher, scoped automatically)
+app.get('/notifications', authenticate, async (req, res) => {
+  try {
+    const where =
+      req.user.role === 'headteacher'
+        ? { recipientRole: 'headteacher' }
+        : { recipientRole: 'teacher', teacherId: req.user.teacherId };
+
+    const notifications = await prisma.notification.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+    });
+    const unreadCount = await prisma.notification.count({ where: { ...where, read: false } });
+
+    res.json({ notifications, unreadCount });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Mark a single notification as read
+app.put('/notifications/:id/read', authenticate, async (req, res) => {
+  try {
+    const notification = await prisma.notification.findUnique({ where: { id: Number(req.params.id) } });
+    if (!notification) return res.status(404).json({ error: 'Notification not found' });
+
+    const belongsToUser =
+      req.user.role === 'headteacher'
+        ? notification.recipientRole === 'headteacher'
+        : notification.recipientRole === 'teacher' && notification.teacherId === req.user.teacherId;
+
+    if (!belongsToUser) return res.status(403).json({ error: 'Not your notification' });
+
+    const updated = await prisma.notification.update({
+      where: { id: notification.id },
+      data: { read: true },
+    });
+    res.json(updated);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Mark all of the current user's notifications as read
+app.put('/notifications/read-all', authenticate, async (req, res) => {
+  try {
+    const where =
+      req.user.role === 'headteacher'
+        ? { recipientRole: 'headteacher' }
+        : { recipientRole: 'teacher', teacherId: req.user.teacherId };
+
+    await prisma.notification.updateMany({ where, data: { read: true } });
+    res.json({ message: 'All notifications marked as read' });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Pulls the plain text out of a PDF or Word (.docx) lesson note so it can
+// be sent to Claude. Old-style .doc files aren't supported by mammoth.
+async function extractTextFromNote(note) {
+  const fullPath = path.join(__dirname, note.filePath);
+  const ext = path.extname(note.fileName).toLowerCase();
+
+  if (ext === '.pdf') {
+    const buffer = fs.readFileSync(fullPath);
+    const result = await pdfParse(buffer);
+    return result.text;
+  }
+
+  if (ext === '.docx') {
+    const result = await mammoth.extractRawText({ path: fullPath });
+    return result.value;
+  }
+
+  throw new Error('This file type (.doc) can\'t be read automatically yet — only PDF and .docx are supported for AI features.');
+}
+
+// Keeps the prompt a reasonable size — lesson notes are usually short,
+// but this protects against extremely long documents.
+function truncateText(text, maxChars = 12000) {
+  if (text.length <= maxChars) return text;
+  return text.slice(0, maxChars) + '\n\n[...truncated...]';
+}
+
+// Headteacher asks Claude to generate a one-line summary of a lesson note
+app.post('/lesson-notes/:id/summarize', authenticate, requireHeadteacher, async (req, res) => {
+  try {
+    const note = await prisma.lessonNote.findUnique({ where: { id: Number(req.params.id) } });
+    if (!note) return res.status(404).json({ error: 'Lesson note not found' });
+
+    const text = truncateText(await extractTextFromNote(note));
+    if (!text.trim()) {
+      return res.status(400).json({ error: 'No readable text found in this file.' });
+    }
+
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-5',
+      max_tokens: 150,
+      messages: [
+        {
+          role: 'user',
+          content: `Here is the content of a teacher's lesson note titled "${note.title}" (subject: ${note.subject || 'unspecified'}). Summarize what this lesson covers in ONE short sentence (under 25 words), written for a busy headteacher skimming a review queue. Only output the sentence, nothing else.\n\nLesson note content:\n${text}`,
+        },
+      ],
+    });
+
+    const summary = response.content[0]?.text?.trim() || 'Summary unavailable.';
+
+    const updated = await prisma.lessonNote.update({
+      where: { id: note.id },
+      data: { summary },
+    });
+    res.json(updated);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Headteacher asks Claude to draft a first-pass review comment
+app.post('/lesson-notes/:id/suggest-feedback', authenticate, requireHeadteacher, async (req, res) => {
+  try {
+    const note = await prisma.lessonNote.findUnique({ where: { id: Number(req.params.id) } });
+    if (!note) return res.status(404).json({ error: 'Lesson note not found' });
+
+    const text = truncateText(await extractTextFromNote(note));
+    if (!text.trim()) {
+      return res.status(400).json({ error: 'No readable text found in this file.' });
+    }
+
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-5',
+      max_tokens: 300,
+      messages: [
+        {
+          role: 'user',
+          content: `You are helping a headteacher review a teacher's lesson note titled "${note.title}" (subject: ${note.subject || 'unspecified'}, ${note.week || 'week unspecified'}). Draft a short, constructive review comment (2-4 sentences) the headteacher could send to the teacher — note one specific strength and one specific, actionable suggestion for improvement. Keep it warm but professional. Only output the comment itself, nothing else (no preamble like "Here's a draft").\n\nLesson note content:\n${text}`,
+        },
+      ],
+    });
+
+    const suggestion = response.content[0]?.text?.trim() || '';
+    res.json({ suggestion });
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
@@ -593,6 +998,18 @@ app.delete('/lesson-notes/:id', authenticate, requireHeadteacher, async (req, re
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
+});
+
+// ================== GLOBAL ERROR HANDLER ==================
+// Catches errors thrown by middleware like Multer (e.g. wrong file type,
+// file too large) that would otherwise crash the request and return
+// an HTML error page instead of JSON.
+app.use((err, req, res, next) => {
+  if (err) {
+    console.error('Unhandled error:', err.message);
+    return res.status(400).json({ error: err.message || 'Something went wrong' });
+  }
+  next();
 });
 
 const PORT = 3000;

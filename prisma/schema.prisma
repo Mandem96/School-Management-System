@@ -36,8 +36,10 @@ model Teacher {
 
   createdAt DateTime @default(now())
 
-  attendance  Attendance[]
-  lessonNotes LessonNote[]
+  attendance    Attendance[]
+  lessonNotes   LessonNote[]
+  acknowledgements AnnouncementAck[]
+  notifications Notification[]
 }
 
 model Attendance {
@@ -61,6 +63,45 @@ model LessonNote {
   filePath   String
   status     String    @default("pending") // "pending", "approved", "needs_revision"
   comment    String?
+  summary    String?   // AI-generated one-line summary of the note's content
   reviewedAt DateTime?
   createdAt  DateTime  @default(now())
+}
+
+// A headteacher post — either a plain announcement (no eventDate) or a
+// calendar event (has an eventDate/time). Teachers acknowledge it, and the
+// headteacher is notified back when they do.
+model Announcement {
+  id        Int      @id @default(autoincrement())
+  title     String
+  message   String
+  eventDate DateTime? // set = shows on the calendar as an event; null = plain announcement
+  createdAt DateTime  @default(now())
+
+  acknowledgements AnnouncementAck[]
+}
+
+model AnnouncementAck {
+  id             Int          @id @default(autoincrement())
+  announcementId Int
+  announcement   Announcement @relation(fields: [announcementId], references: [id])
+  teacherId      Int
+  teacher        Teacher      @relation(fields: [teacherId], references: [id])
+  acknowledgedAt DateTime     @default(now())
+
+  @@unique([announcementId, teacherId])
+}
+
+// A single notification bell entry. For headteacher notifications,
+// teacherId is left empty since there's only one headteacher account.
+model Notification {
+  id            Int      @id @default(autoincrement())
+  recipientRole String   // "headteacher" or "teacher"
+  teacherId     Int?
+  teacher       Teacher? @relation(fields: [teacherId], references: [id])
+  type          String   // "note_reviewed", "new_announcement", "announcement_ack"
+  message       String
+  relatedId     Int?     // e.g. the lessonNoteId or announcementId this refers to
+  read          Boolean  @default(false)
+  createdAt     DateTime @default(now())
 }
