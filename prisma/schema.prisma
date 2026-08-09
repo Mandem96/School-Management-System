@@ -76,6 +76,7 @@ model Announcement {
   title     String
   message   String
   eventDate DateTime? // set = shows on the calendar as an event; null = plain announcement
+  priority  String   @default("normal") // "normal" or "important" — controls the calendar color
   createdAt DateTime  @default(now())
 
   acknowledgements AnnouncementAck[]

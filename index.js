@@ -717,7 +717,7 @@ app.put('/lesson-notes/:id/review', authenticate, requireHeadteacher, async (req
 // it's treated as a calendar event; otherwise it's a plain announcement.
 app.post('/announcements', authenticate, requireHeadteacher, async (req, res) => {
   try {
-    const { title, message, eventDate } = req.body;
+    const { title, message, eventDate, priority } = req.body;
     if (!title || !message) {
       return res.status(400).json({ error: 'Title and message are required' });
     }
@@ -727,6 +727,7 @@ app.post('/announcements', authenticate, requireHeadteacher, async (req, res) =>
         title,
         message,
         eventDate: eventDate ? new Date(eventDate) : null,
+        priority: priority === 'important' ? 'important' : 'normal',
       },
     });
 
@@ -775,6 +776,7 @@ app.get('/announcements', authenticate, async (req, res) => {
       title: a.title,
       message: a.message,
       eventDate: a.eventDate,
+      priority: a.priority,
       createdAt: a.createdAt,
       acknowledged: a.acknowledgements.some((ack) => ack.teacherId === req.user.teacherId),
       acknowledgedCount: a.acknowledgements.length,
@@ -889,6 +891,41 @@ app.put('/notifications/read-all', authenticate, async (req, res) => {
 
     await prisma.notification.updateMany({ where, data: { read: true } });
     res.json({ message: 'All notifications marked as read' });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Clear (delete) a single notification
+app.delete('/notifications/:id', authenticate, async (req, res) => {
+  try {
+    const notification = await prisma.notification.findUnique({ where: { id: Number(req.params.id) } });
+    if (!notification) return res.status(404).json({ error: 'Notification not found' });
+
+    const belongsToUser =
+      req.user.role === 'headteacher'
+        ? notification.recipientRole === 'headteacher'
+        : notification.recipientRole === 'teacher' && notification.teacherId === req.user.teacherId;
+
+    if (!belongsToUser) return res.status(403).json({ error: 'Not your notification' });
+
+    await prisma.notification.delete({ where: { id: notification.id } });
+    res.json({ message: 'Notification cleared' });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Clear (delete) all of the current user's notifications
+app.delete('/notifications', authenticate, async (req, res) => {
+  try {
+    const where =
+      req.user.role === 'headteacher'
+        ? { recipientRole: 'headteacher' }
+        : { recipientRole: 'teacher', teacherId: req.user.teacherId };
+
+    await prisma.notification.deleteMany({ where });
+    res.json({ message: 'All notifications cleared' });
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
